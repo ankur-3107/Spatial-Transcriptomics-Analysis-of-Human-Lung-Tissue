@@ -1,0 +1,281 @@
+
+------------------------------------------------------------------
+title: "Spatial Transcriptomics Analysis of Human Lung Tissue"
+author: "Ankur Meshram"
+date: "`r Sys.Date()`"
+output: github_document
+------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Introduction 
+
+This project provides a full analysis pipeline for **spatial transcriptomics** data using the **Visium** platform (10x Genomics) in a public repository dataset, **GSE264233**. The dataset contains all the gene expression matrices and corresponding microscopy images of the tissue. Spatial transcriptomics allows for the examination of gene expression in its native spatial context, which is an incredible opportunity to investigate tissue architecture, cellular heterogeneity, and disease microenvironments. 
+
+The purpose of this analysis was to visualize, preprocess, normalize, and understand the gene expression landscape in human tissue samples incorporating both spatial and transcriptomic data. To achieve this we combined packages **Seurat**, **clusterProfiler**, and **enrichR** for the end-to-end analysis.
+
+The workflow includes the following steps:
+1. Expression data preparation
+2. Visualization of tissue images
+3. Spatial mapping of barcode coordinates
+4. Creating a Seurat object with spatial metadata
+5. Quality control and filtering
+6. Normalization and dimensionality reduction
+7. Clustering and marker identification
+8. Spatial visualization of clusters
+9. GO and KEGG pathway enrichment analysis
+
+
+## Set the working directory and list data files 
+
+```{r}
+setwd("C:/Users/meshr/Downloads/spatial_transcriptomics")
+list.files()
+```
+
+
+## Expression Profile Preparation 
+
+```{r}
+# Load required packages
+library(data.table)
+library(Matrix)
+
+# Load raw data
+barcodes <- fread("GSE264233/barcodes.tsv", header = FALSE)
+features <- fread("GSE264233/features.tsv", header = FALSE)
+matrix <- Matrix::readMM("GSE264233/matrix.mtx")
+
+# Create expression profile
+expr_mat <- matrix
+rownames(expr_mat) <- make.unique(features$V2)
+colnames(expr_mat) <- barcodes$V1
+expr_mat <- as.matrix(expr_mat)
+expr_df <- as.data.frame(expr_mat)
+expr_df[1:5, 1:5]
+```
+
+## Visualizing Histological Tissue Images 
+
+```{r}
+# Load required packages
+library(magick)
+library(grid)
+library(gridExtra)
+
+# Load all images
+img1 <- image_read("GSE264233/GSM8208231_D1_aligned_fiducials.jpg")
+img2 <- image_read("GSE264233/GSM8208231_D1_detected_tissue_image.jpg")
+img3 <- image_read("GSE264233/GSM8208231_D1_tissue_hires_image.png")
+img4 <- image_read("GSE264233/GSM8208231_D1_tissue_lowres_image.png")
+
+# Visualize the images
+g1 <- rasterGrob(as.raster(img1), interpolate = TRUE)
+g2 <- rasterGrob(as.raster(img2), interpolate = TRUE)
+g3 <- rasterGrob(as.raster(img3), interpolate = TRUE)
+g4 <- rasterGrob(as.raster(img4), interpolate = TRUE)
+grid.arrange(g1, g2, g3, g4, ncol = 2, top = "Spatial Transcriptomics Images")
+```
+
+
+## Plot Tissue Map Using Barcode Coordinates 
+
+```{r}
+# Load required packages
+library(dplyr)
+library(ggplot2)
+
+expr_barcodes <- colnames(expr_df)
+coords <- read.csv("GSE264233/GSM8208231_D1_tissue_positions_list.csv")
+matched_coords <- coords %>% filter(barcode %in% expr_barcodes)
+
+ggplot(matched_coords, aes(x = pxl_col_in_fullres, y = pxl_row_in_fullres)) +
+  geom_point(color = "blue", size = 1) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "Tissue Plot Using Barcode Coordinates",
+       x = "Pixel Column (x)", y = "Pixel Row (y)")
+```
+
+
+## Create Seurat Object with Spatial Info 
+
+```{r}
+library(Seurat)
+seurat_obj <- CreateSeuratObject(counts = expr_df, assay = "Spatial")
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, coords[Cells(seurat_obj), ])
+```
+
+
+## QC and Filtering 
+
+```{r}
+# The data is already filtered and it does not have mitochondrial, ribosomal and chloroplast genes.
+VlnPlot(seurat_obj, features = c("nFeature_Spatial", "nCount_Spatial"), ncol = 2)
+```
+
+```{r}
+FeatureScatter(seurat_obj, feature1 = "nCount_Spatial", feature2 = "nFeature_Spatial")
+```
+```{r}
+# filtering
+seurat_obj <- subset(seurat_obj,
+                     subset = nFeature_Spatial > 200 &
+                              nFeature_Spatial < 7000)
+```
+
+
+## Normalization and Dimensionality Reduction 
+
+```{r}
+seurat_obj <- suppressWarnings(SCTransform(seurat_obj, assay = "Spatial", verbose = TRUE))
+seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:30)
+DimPlot(seurat_obj, reduction = "umap", label = TRUE) 
+DimPlot(seurat_obj, reduction = "pca", label = TRUE)
+```
+
+
+## Clustering and Identifying Cluster Markers 
+
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:30)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters", label = TRUE) 
+DimPlot(seurat_obj, reduction = "pca", group.by = "seurat_clusters", label = TRUE)
+```
+
+```{r}
+cluster_markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+head(cluster_markers)
+```
+
+
+```{r}
+# top markers from each cluster
+FeaturePlot(seurat_obj, features = c("COL4A1", "A2M", "CTSD", "SCGB1A1", "COL3A1", "SFTPB", "ACTA2"), ncol = 2)
+```
+
+
+## Spatial Visualization of Clusters 
+
+```{r}
+library(jpeg)
+library(png)
+library(patchwork)
+library(jsonlite)
+
+coords <- coords[coords$barcode %in% colnames(seurat_obj), ]
+image_info <- data.frame(
+  row = coords$array_row,
+  col = coords$array_col,
+  tissue = coords$in_tissue,
+  imagerow = coords$pxl_row_in_fullres,
+  imagecol = coords$pxl_col_in_fullres,
+  stringsAsFactors = FALSE
+)
+rownames(image_info) <- coords$barcode
+
+scale_json <- fromJSON("GSE264233/GSM8208231_D1_scalefactors_json.json")
+sf <- scalefactors(
+  spot = scale_json$spot_diameter_fullres,
+  fiducial = scale_json$fiducial_diameter_fullres,
+  hires = scale_json$tissue_hires_scalef,
+  lowres = scale_json$tissue_lowres_scalef
+)
+
+fullres_img <- readJPEG("GSE264233/GSM8208231_D1_detected_tissue_image.jpg")
+fiducial_img <- readJPEG("GSE264233/GSM8208231_D1_aligned_fiducials.jpg")
+hires_img <- readPNG("GSE264233/GSM8208231_D1_tissue_hires_image.png")
+lowres_img <- readPNG("GSE264233/GSM8208231_D1_tissue_lowres_image.png")
+
+seurat_obj@images[["fullres"]] <- new("VisiumV1", image = fullres_img, scale.factors = sf, coordinates = image_info)
+seurat_obj@images[["fiducial"]] <- new("VisiumV1", image = fiducial_img, scale.factors = sf, coordinates = image_info)
+seurat_obj@images[["hires"]] <- new("VisiumV1", image = hires_img, scale.factors = sf, coordinates = image_info)
+seurat_obj@images[["lowres"]] <- new("VisiumV1", image = lowres_img, scale.factors = sf, coordinates = image_info)
+
+p1 <- SpatialPlot(seurat_obj, images = "fullres", label = TRUE, pt.size.factor = 1.2) + ggtitle("Full Resolution")
+p2 <- SpatialPlot(seurat_obj, images = "hires", label = TRUE, pt.size.factor = 1.2) + ggtitle("High Resolution")
+p3 <- SpatialPlot(seurat_obj, images = "lowres", label = TRUE, pt.size.factor = 1.2) + ggtitle("Low Resolution")
+p4 <- SpatialPlot(seurat_obj, images = "fiducial", label = TRUE, pt.size.factor = 1.2) + ggtitle("Aligned Fiducials")
+
+(p1 | p2) / (p3 | p4)
+```
+
+
+## Gene Ontology (GO) Analysis 
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+# Top genes from cluster 0
+top_genes <- cluster_markers %>% filter(cluster == 0) %>% top_n(n = 100, wt = avg_log2FC)
+
+gene_symbols <- top_genes$gene
+entrez_ids <- bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+ego <- enrichGO(gene = entrez_ids$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "BP",
+                pAdjustMethod = "BH",
+                qvalueCutoff = 0.05)
+
+dotplot(ego, showCategory = 20) 
+barplot(ego, showCategory = 20, title = "GO Biological Process")
+emapplot(pairwise_termsim(ego), showCategory = 30) 
+cnetplot(ego, categorySize = "pvalue", foldChange = NULL)
+```
+
+
+## KEGG Pathway Enrichment Analysis 
+
+```{r}
+ekegg <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                    organism = 'hsa',
+                    pvalueCutoff = 0.05)
+
+dotplot(ekegg, showCategory = 20) 
+barplot(ekegg, showCategory = 20, title = "KEGG Pathways")
+ekegg_sim <- pairwise_termsim(ekegg)
+emapplot(ekegg_sim, showCategory = 30)
+cnetplot(ekegg, categorySize = "pvalue", foldChange = NULL)
+```
+
+```{r}
+# Module Enrichment Analysis
+mkegg <- enrichMKEGG(gene = entrez_ids$ENTREZID,
+            organism = "hsa",
+            keyType = "kegg",
+            pvalueCutoff = 0.05,
+            pAdjustMethod = "BH")
+mkegg@result
+```
+
+
+## KEGG Enrichment Using Enrichr 
+
+```{r}
+library(enrichR)
+dbs_to_use <- c("GO_Biological_Process_2021", "KEGG_2021_Human")
+enriched <- enrichr(top_genes$gene, dbs_to_use)
+
+enrichr_kegg <- enriched[["KEGG_2021_Human"]]
+enrichR::plotEnrich(enrichr_kegg, showTerms = 20, numChar = 40, y = "P.value")
+
+top_terms <- enrichr_kegg[1:20, ]
+top_terms$Term <- factor(top_terms$Term, levels = rev(top_terms$Term))
+
+ggplot(top_terms, aes(x = Combined.Score, y = Term)) +
+  geom_point(aes(size = -log10(P.value), color = Adjusted.P.value)) +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_minimal() +
+  labs(title = "KEGG Enrichment (enrichR)", x = "Combined Score", y = "") +
+  theme(axis.text.y = element_text(size = 10))
+```
